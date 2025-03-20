@@ -1,6 +1,5 @@
 [build]
   command = "deno bundle main.ts ./functions/main.js"
-  publish = "public"
   functions = "functions"
 
 [build.environment]
