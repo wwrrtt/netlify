@@ -1,0 +1,12 @@
+[build]
+  command = "deno bundle main.ts ./functions/main.js"
+  publish = "public"
+  functions = "functions"
+
+[build.environment]
+  DENO_VERSION = "1.32.5"
+
+[[redirects]]
+  from = "/"
+  to = "/.netlify/functions/main"
+  status = 200
