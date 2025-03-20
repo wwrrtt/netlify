@@ -449,31 +449,34 @@ class Session {
   }
 }
 
-// ISP and IP retrieval
-let ISP = "";
-try {
-  const p = Deno.run({
-    cmd: ["curl", "-s", "https://speed.cloudflare.com/meta"],
-    stdout: "piped",
-  });
-  const output = await p.output();
-  const metaInfo = new TextDecoder().decode(output);
-  const parts = metaInfo.split('"');
-  ISP = (parts[25] + "-" + parts[17]).replace(/ /g, "_");
-} catch (err) {
-  log("error", "Failed to get ISP info:", err.message);
-  ISP = "unknown";
+// 获取ISP信息的函数
+async function getISPInfo(): Promise<string> {
+  try {
+    const p = Deno.run({
+      cmd: ["curl", "-s", "https://speed.cloudflare.com/meta"],
+      stdout: "piped",
+    });
+    const output = await p.output();
+    const metaInfo = new TextDecoder().decode(output);
+    const parts = metaInfo.split('"');
+    return (parts[25] + "-" + parts[17]).replace(/ /g, "_");
+  } catch (err) {
+    log("error", "Failed to get ISP info:", err.message);
+    return "unknown";
+  }
 }
 
-let IP = DOMAIN;
-if (!DOMAIN) {
+// 获取IP地址的函数
+async function getIPAddress(): Promise<string> {
+  if (DOMAIN) return DOMAIN;
+  
   try {
     const p = Deno.run({
       cmd: ["curl", "-s", "--max-time", "2", "ipv4.ip.sb"],
       stdout: "piped",
     });
     const output = await p.output();
-    IP = new TextDecoder().decode(output).trim();
+    return new TextDecoder().decode(output).trim();
   } catch (err) {
     try {
       const p = Deno.run({
@@ -481,10 +484,10 @@ if (!DOMAIN) {
         stdout: "piped",
       });
       const output = await p.output();
-      IP = `[${new TextDecoder().decode(output).trim()}]`;
+      return `[${new TextDecoder().decode(output).trim()}]`;
     } catch (ipv6Err) {
       log("error", "Failed to get IP address:", ipv6Err.message);
-      IP = "localhost";
+      return "localhost";
     }
   }
 }
@@ -495,109 +498,123 @@ function generatePadding(min: number, max: number): string {
   return btoa(Array(length).fill("X").join(""));
 }
 
-// HTTP server
-serve(
-  async (req: Request): Promise<Response> => {
-    const url = new URL(req.url);
-    const path = url.pathname;
+// 初始化并启动服务器
+async function initServer() {
+  const ISP = await getISPInfo();
+  const IP = await getIPAddress();
 
-    const headers = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST",
-      "Cache-Control": "no-store",
-      "X-Accel-Buffering": "no",
-      "X-Padding": generatePadding(100, 1000),
-    };
+  serve(
+    async (req: Request): Promise<Response> => {
+      const url = new URL(req.url);
+      const path = url.pathname;
 
-    if (path === "/") {
-      return new Response("Hello, World\n", {
-        status: 200,
-        headers: { "Content-Type": "text/plain" },
-      });
-    }
+      const headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST",
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+        "X-Padding": generatePadding(100, 1000),
+      };
 
-    if (path === `/${SUB_PATH}`) {
-      const vlessURL = `vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
-      const base64Content = btoa(vlessURL);
-      return new Response(base64Content + "\n", {
-        status: 200,
-        headers: { "Content-Type": "text/plain" },
-      });
-    }
+      if (path === "/") {
+        return new Response("Hello, World\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
 
-    const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
-    if (!pathMatch) {
+      if (path === `/${SUB_PATH}`) {
+        const vlessURL = `vless://${UUID}@${IP}:${PORT}?encryption=none&security=none&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
+        const base64Content = btoa(vlessURL);
+        return new Response(base64Content + "\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+
+      const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
+      if (!pathMatch) {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      const uuid = pathMatch[1];
+      const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
+
+      if (req.method === "GET" && !seq) {
+        let session = sessions.get(uuid);
+        if (!session) {
+          session = new Session(uuid);
+          sessions.set(uuid, session);
+          log("info", `Created new session for GET: ${uuid}`);
+        }
+
+        session.downstreamStarted = true;
+        const { readable, writable } = new TransformStream();
+        session.startDownstream({ writable });
+
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            ...headers,
+            "Content-Type": "application/octet-stream",
+            "Transfer-Encoding": "chunked",
+          },
+        });
+      }
+
+      if (req.method === "POST" && seq !== null) {
+        let session = sessions.get(uuid);
+        if (!session) {
+          session = new Session(uuid);
+          sessions.set(uuid, session);
+          log("info", `Created new session for POST: ${uuid}`);
+
+          setTimeout(() => {
+            const currentSession = sessions.get(uuid);
+            if (currentSession && !currentSession.downstreamStarted) {
+              log("warn", `Session ${uuid} timed out without downstream`);
+              currentSession.cleanup();
+              sessions.delete(uuid);
+            }
+          }, SETTINGS.SESSION_TIMEOUT);
+        }
+
+        const data = await req.arrayBuffer();
+        const buffer = new Uint8Array(data);
+        log("info", `Processing packet: seq=${seq}, size=${buffer.length}`);
+
+        try {
+          await session.processPacket(seq, buffer);
+          return new Response(null, { status: 200, headers });
+        } catch (err) {
+          log("error", `Failed to process POST request: ${err.message}`);
+          session.cleanup();
+          sessions.delete(uuid);
+          return new Response(null, { status: 500 });
+        }
+      }
+
       return new Response("Not Found", { status: 404 });
-    }
-
-    const uuid = pathMatch[1];
-    const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
-
-    if (req.method === "GET" && !seq) {
-      let session = sessions.get(uuid);
-      if (!session) {
-        session = new Session(uuid);
-        sessions.set(uuid, session);
-        log("info", `Created new session for GET: ${uuid}`);
-      }
-
-      session.downstreamStarted = true;
-      const { readable, writable } = new TransformStream();
-      session.startDownstream({ writable });
-
-      return new Response(readable, {
-        status: 200,
-        headers: {
-          ...headers,
-          "Content-Type": "application/octet-stream",
-          "Transfer-Encoding": "chunked",
-        },
-      });
-    }
-
-    if (req.method === "POST" && seq !== null) {
-      let session = sessions.get(uuid);
-      if (!session) {
-        session = new Session(uuid);
-        sessions.set(uuid, session);
-        log("info", `Created new session for POST: ${uuid}`);
-
-        setTimeout(() => {
-          const currentSession = sessions.get(uuid);
-          if (currentSession && !currentSession.downstreamStarted) {
-            log("warn", `Session ${uuid} timed out without downstream`);
-            currentSession.cleanup();
-            sessions.delete(uuid);
-          }
-        }, SETTINGS.SESSION_TIMEOUT);
-      }
-
-      const data = await req.arrayBuffer();
-      const buffer = new Uint8Array(data);
-      log("info", `Processing packet: seq=${seq}, size=${buffer.length}`);
-
-      try {
-        await session.processPacket(seq, buffer);
-        return new Response(null, { status: 200, headers });
-      } catch (err) {
-        log("error", `Failed to process POST request: ${err.message}`);
-        session.cleanup();
-        sessions.delete(uuid);
-        return new Response(null, { status: 500 });
+    },
+    { 
+      port: PORT, 
+      onListen: () => {
+        addAccessTask();
+        console.log(`Server is running on port ${PORT}`);
+        log("info", "=================================");
+        log("info", `Log level: ${SETTINGS.LOG_LEVEL}`);
+        log("info", `Max buffered posts: ${SETTINGS.MAX_BUFFERED_POSTS}`);
+        log("info", `Max POST size: ${SETTINGS.MAX_POST_SIZE}KB`);
+        log("info", `Max buffer size: ${SETTINGS.BUFFER_SIZE}KB`);
+        log("info", `Session timeout: ${SETTINGS.CHUNK_SIZE}bytes`);
+        log("info", "=================================");
       }
     }
+  );
+}
 
-    return new Response("Not Found", { status: 404 });
-  },
-  { port: PORT, onListen: () => {
-    addAccessTask();
-    console.log(`Server is running on port ${PORT}`);
-    log("info", "=================================");
-    log("info", `Log level: ${SETTINGS.LOG_LEVEL}`);
-    log("info", `Max buffered posts: ${SETTINGS.MAX_BUFFERED_POSTS}`);
-    log("info", `Max POST size: ${SETTINGS.MAX_POST_SIZE}KB`);
-    log("info", `Max buffer size: ${SETTINGS.BUFFER_SIZE}KB`);
-    log("info", `Session timeout: ${SETTINGS.CHUNK_SIZE}bytes`);
-    log("info", "=================================");
-  } }
-);
+// 启动服务器
+initServer().catch(err => {
+  console.error("Failed to start server:", err);
+  Deno.exit(1);
+});
